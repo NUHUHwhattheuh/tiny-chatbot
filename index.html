@@ -42,7 +42,7 @@
 
 <script>
 // =========================================================
-// CONFIG / TOKENIZER — loaded from exported files
+// CONFIG / TOKENIZER â€” loaded from exported files
 // =========================================================
 let session = null;
 let config = null;
@@ -70,8 +70,8 @@ function bytesToUnicode() {
   // Mirrors HF's byte-to-unicode mapping so byte-level BPE round-trips correctly.
   const bs = [];
   for (let i = "!".codePointAt(0); i <= "~".codePointAt(0); i++) bs.push(i);
-  for (let i = "¡".codePointAt(0); i <= "¬".codePointAt(0); i++) bs.push(i);
-  for (let i = "®".codePointAt(0); i <= "ÿ".codePointAt(0); i++) bs.push(i);
+  for (let i = "Â¡".codePointAt(0); i <= "Â¬".codePointAt(0); i++) bs.push(i);
+  for (let i = "Â®".codePointAt(0); i <= "Ã¿".codePointAt(0); i++) bs.push(i);
   const cs = bs.slice();
   let n = 0;
   for (let b = 0; b < 256; b++) {
@@ -105,7 +105,7 @@ function bpe(token) {
   if (bpeCache[token]) return bpeCache[token];
   let word = token.split("");
   let pairs = getPairs(word);
-  if (pairs.size === 0) return token;
+  if (pairs.size === 0) return word; // return array of chars, not the raw string
 
   while (true) {
     let minPair = null;
@@ -205,7 +205,7 @@ async function loadModel() {
     executionProviders: ["wasm"], // works on both desktop & mobile browsers
   });
 
-  statusDiv.textContent = "Ready! Say hi ";
+  statusDiv.textContent = "Ready! Say hi ðŸ‘‹";
   input.disabled = false;
   sendBtn.disabled = false;
 }
@@ -235,10 +235,19 @@ async function generateReply(promptText, maxNewTokens = 40) {
   let ids = [config.bos_id, ...encodeText(promptText + " "), config.sep_id];
 
   for (let step = 0; step < maxNewTokens; step++) {
-    // truncate to block_size from the end (sliding window)
-    const context = ids.slice(-config.block_size);
-    const padLen = config.block_size - context.length;
-    const inputIds = new Array(padLen).fill(config.pad_id).concat(context);
+    // Training data was right-padded (real tokens start at position 0,
+    // padding fills the remainder), so we must match that here â€” the
+    // model's positional embeddings were only ever trained with real
+    // content starting at index 0.
+    let context = ids;
+    if (context.length > config.block_size) {
+      // If we exceed block_size, keep the most recent tokens but they'll
+      // now start at position 0 in this window (sliding window semantics).
+      context = context.slice(-config.block_size);
+    }
+    const realLen = context.length;
+    const padLen = config.block_size - realLen;
+    const inputIds = context.concat(new Array(padLen).fill(config.pad_id));
 
     const tensor = new ort.Tensor(
       "int64",
@@ -248,9 +257,11 @@ async function generateReply(promptText, maxNewTokens = 40) {
 
     const output = await session.run({ input_ids: tensor });
     const logits = output.logits.data; // flattened [1, seq, vocab]
-    const seqLen = inputIds.length;
     const vocabSize = config.vocab_size;
-    const lastStepLogits = logits.slice((seqLen - 1) * vocabSize, seqLen * vocabSize);
+    // Read logits from the LAST REAL token's position, not the last
+    // (padded) slot in the sequence.
+    const lastRealIdx = realLen - 1;
+    const lastStepLogits = logits.slice(lastRealIdx * vocabSize, (lastRealIdx + 1) * vocabSize);
 
     const nextId = sampleFromLogits(lastStepLogits);
     ids.push(nextId);
