@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tiny Browser Chatbot</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    max-width: 600px;
+    margin: 0 auto;
+    padding: 16px;
+    background: #f7f7f8;
+  }
+  #chat {
+    height: 60vh;
+    overflow-y: auto;
+    background: white;
+    border-radius: 12px;
+    padding: 12px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    margin-bottom: 12px;
+  }
+  .msg { margin: 8px 0; padding: 8px 12px; border-radius: 12px; max-width: 80%; }
+  .user { background: #007aff; color: white; margin-left: auto; }
+  .bot { background: #e5e5ea; color: black; }
+  #inputRow { display: flex; gap: 8px; }
+  #input { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+  button { padding: 10px 16px; border-radius: 8px; border: none; background: #007aff; color: white; }
+  #status { font-size: 12px; color: #888; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <h2>Tiny Browser Chatbot</h2>
+  <div id="status">Loading model...</div>
+  <div id="chat"></div>
+  <div id="inputRow">
+    <input id="input" placeholder="Say something..." disabled />
+    <button id="send" disabled>Send</button>
+  </div>
+
+<script>
+// =========================================================
+// CONFIG / TOKENIZER — loaded from exported files
+// =========================================================
+let session = null;
+let config = null;
+let vocab = null;      // token string -> id
+let idToToken = null;  // id -> token string
+let merges = [];       // BPE merge rules
+
+const chatDiv = document.getElementById("chat");
+const statusDiv = document.getElementById("status");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+
+function addMessage(text, cls) {
+  const div = document.createElement("div");
+  div.className = "msg " + cls;
+  div.textContent = text;
+  chatDiv.appendChild(div);
+  chatDiv.scrollTop = chatDiv.scrollHeight;
+}
+
+// --- Minimal byte-level BPE tokenizer (matches HuggingFace ByteLevelBPETokenizer) ---
+// This is a simplified encoder sufficient for inference given vocab.json + merges.txt.
+
+function bytesToUnicode() {
+  // Mirrors HF's byte-to-unicode mapping so byte-level BPE round-trips correctly.
+  const bs = [];
+  for (let i = "!".codePointAt(0); i <= "~".codePointAt(0); i++) bs.push(i);
+  for (let i = "¡".codePointAt(0); i <= "¬".codePointAt(0); i++) bs.push(i);
+  for (let i = "®".codePointAt(0); i <= "ÿ".codePointAt(0); i++) bs.push(i);
+  const cs = bs.slice();
+  let n = 0;
+  for (let b = 0; b < 256; b++) {
+    if (!bs.includes(b)) {
+      bs.push(b);
+      cs.push(256 + n);
+      n += 1;
+    }
+  }
+  const byteToChar = {};
+  for (let i = 0; i < bs.length; i++) {
+    byteToChar[bs[i]] = String.fromCodePoint(cs[i]);
+  }
+  return byteToChar;
+}
+const BYTE_TO_CHAR = bytesToUnicode();
+const CHAR_TO_BYTE = Object.fromEntries(Object.entries(BYTE_TO_CHAR).map(([k, v]) => [v, parseInt(k)]));
+
+function getPairs(word) {
+  const pairs = new Set();
+  for (let i = 0; i < word.length - 1; i++) {
+    pairs.add(word[i] + "\u0001" + word[i + 1]);
+  }
+  return pairs;
+}
+
+const bpeCache = {};
+let mergeRank = {};
+
+function bpe(token) {
+  if (bpeCache[token]) return bpeCache[token];
+  let word = token.split("");
+  let pairs = getPairs(word);
+  if (pairs.size === 0) return token;
+
+  while (true) {
+    let minPair = null;
+    let minRank = Infinity;
+    for (const pair of pairs) {
+      const rank = mergeRank[pair];
+      if (rank !== undefined && rank < minRank) {
+        minRank = rank;
+        minPair = pair;
+      }
+    }
+    if (minPair === null) break;
+    const [first, second] = minPair.split("\u0001");
+    const newWord = [];
+    let i = 0;
+    while (i < word.length) {
+      const j = word.indexOf(first, i);
+      if (j === -1) {
+        newWord.push(...word.slice(i));
+        break;
+      }
+      newWord.push(...word.slice(i, j));
+      if (j < word.length - 1 && word[j + 1] === second) {
+        newWord.push(first + second);
+        i = j + 2;
+      } else {
+        newWord.push(word[j]);
+        i = j + 1;
+      }
+    }
+    word = newWord;
+    if (word.length === 1) break;
+    pairs = getPairs(word);
+  }
+  bpeCache[token] = word;
+  return word;
+}
+
+function encodeText(text) {
+  // Byte-level pre-tokenize: split on GPT-2-style pattern (simplified: split on spaces, keep them attached)
+  const pattern = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+  const words = text.match(pattern) || [];
+  let ids = [];
+  for (const word of words) {
+    const byteEncoded = Array.from(new TextEncoder().encode(word))
+      .map((b) => BYTE_TO_CHAR[b])
+      .join("");
+    const bpeTokens = bpe(byteEncoded);
+    for (const t of bpeTokens) {
+      if (vocab[t] !== undefined) ids.push(vocab[t]);
+      else ids.push(vocab["<unk>"]);
+    }
+  }
+  return ids;
+}
+
+function decodeIds(ids) {
+  let chars = "";
+  for (const id of ids) {
+    const tok = idToToken[id];
+    if (tok === undefined) continue;
+    if (["<pad>", "<bos>", "<eos>"].includes(tok)) continue;
+    if (tok === "<turn>") { chars += " "; continue; }
+    chars += tok;
+  }
+  const bytes = [];
+  for (const ch of chars) {
+    if (CHAR_TO_BYTE[ch] !== undefined) bytes.push(CHAR_TO_BYTE[ch]);
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
+}
+
+// =========================================================
+// MODEL LOADING
+// =========================================================
+async function loadModel() {
+  statusDiv.textContent = "Loading tokenizer files...";
+  const [vocabResp, mergesResp, configResp] = await Promise.all([
+    fetch("vocab.json"),
+    fetch("merges.txt"),
+    fetch("config.json"),
+  ]);
+  vocab = await vocabResp.json();
+  idToToken = Object.fromEntries(Object.entries(vocab).map(([k, v]) => [v, k]));
+  config = await configResp.json();
+
+  const mergesText = await mergesResp.text();
+  const mergeLines = mergesText.split("\n").slice(1).filter((l) => l.trim().length > 0);
+  mergeRank = {};
+  mergeLines.forEach((line, idx) => {
+    const [a, b] = line.split(" ");
+    mergeRank[a + "\u0001" + b] = idx;
+  });
+
+  statusDiv.textContent = "Loading model (ONNX)...";
+  session = await ort.InferenceSession.create("model_quantized.onnx", {
+    executionProviders: ["wasm"], // works on both desktop & mobile browsers
+  });
+
+  statusDiv.textContent = "Ready! Say hi ";
+  input.disabled = false;
+  sendBtn.disabled = false;
+}
+
+// =========================================================
+// INFERENCE / GENERATION
+// =========================================================
+function sampleFromLogits(logitsArray, temperature = 0.8, topK = 40) {
+  const scaled = Array.from(logitsArray).map((v) => v / temperature);
+  const indexed = scaled.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+  const top = indexed.slice(0, topK);
+  const maxLogit = top[0][0];
+  const exps = top.map(([v]) => Math.exp(v - maxLogit));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  const probs = exps.map((e) => e / sum);
+
+  let r = Math.random();
+  let cum = 0;
+  for (let i = 0; i < probs.length; i++) {
+    cum += probs[i];
+    if (r <= cum) return top[i][1];
+  }
+  return top[0][1];
+}
+
+async function generateReply(promptText, maxNewTokens = 40) {
+  let ids = [config.bos_id, ...encodeText(promptText + " "), config.sep_id];
+
+  for (let step = 0; step < maxNewTokens; step++) {
+    // truncate to block_size from the end (sliding window)
+    const context = ids.slice(-config.block_size);
+    const padLen = config.block_size - context.length;
+    const inputIds = new Array(padLen).fill(config.pad_id).concat(context);
+
+    const tensor = new ort.Tensor(
+      "int64",
+      BigInt64Array.from(inputIds.map(BigInt)),
+      [1, inputIds.length]
+    );
+
+    const output = await session.run({ input_ids: tensor });
+    const logits = output.logits.data; // flattened [1, seq, vocab]
+    const seqLen = inputIds.length;
+    const vocabSize = config.vocab_size;
+    const lastStepLogits = logits.slice((seqLen - 1) * vocabSize, seqLen * vocabSize);
+
+    const nextId = sampleFromLogits(lastStepLogits);
+    ids.push(nextId);
+
+    if (nextId === config.eos_id) break;
+  }
+
+  // Only decode the newly generated part (after the sep token)
+  const sepIdx = ids.lastIndexOf(config.sep_id);
+  const replyIds = ids.slice(sepIdx + 1);
+  return decodeIds(replyIds).trim();
+}
+
+// =========================================================
+// UI WIRING
+// =========================================================
+async function handleSend() {
+  const text = input.value.trim();
+  if (!text) return;
+  addMessage(text, "user");
+  input.value = "";
+  sendBtn.disabled = true;
+
+  addMessage("...", "bot");
+  const thinkingMsg = chatDiv.lastChild;
+
+  const reply = await generateReply(text);
+  thinkingMsg.textContent = reply || "(no reply generated)";
+
+  sendBtn.disabled = false;
+}
+
+sendBtn.addEventListener("click", handleSend);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") handleSend();
+});
+
+loadModel().catch((err) => {
+  statusDiv.textContent = "Error loading model: " + err.message;
+  console.error(err);
+});
+</script>
+</body>
+</html>

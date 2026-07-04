@@ -1,0 +1,11 @@
+{
+  "vocab_size": 4000,
+  "block_size": 127,
+  "n_layer": 6,
+  "n_head": 8,
+  "n_embd": 256,
+  "pad_id": 0,
+  "bos_id": 1,
+  "eos_id": 2,
+  "sep_id": 3
+}
